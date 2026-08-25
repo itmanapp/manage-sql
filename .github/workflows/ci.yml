@@ -48,23 +48,16 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Download official sample MDF/LDF (AdventureWorksLT2012)
-        run: |
-          mkdir -p data
-          curl -fsSL -o data/AdventureWorksLT2012.mdf \
-            https://github.com/Microsoft/sql-server-samples/releases/download/adventureworks2012/adventure-works-2012-oltp-lt-data-file.mdf
-          curl -fsSL -o data/AdventureWorksLT2012.ldf \
-            https://github.com/Microsoft/sql-server-samples/releases/download/adventureworks2012/adventure-works-2012-oltp-lt-log-file.ldf
-          ls -lh data/
-
-      - name: Copy MDF/LDF into SQL Server container
+      - name: Stream MDF/LDF into SQL Server container
+        env:
+          MDF_URL: https://github.com/Microsoft/sql-server-samples/releases/download/adventureworks2012/adventure-works-2012-oltp-lt-data-file.mdf
+          LDF_URL: https://github.com/Microsoft/sql-server-samples/releases/download/adventureworks2012/adventure-works-2012-oltp-lt-log-file.ldf
         run: |
           CID=$(docker ps -q --filter name=mssql)
           echo "container: $CID"
-          docker cp data/AdventureWorksLT2012.mdf "$CID":/var/opt/mssql/data/
-          docker cp data/AdventureWorksLT2012.ldf "$CID":/var/opt/mssql/data/
-          docker exec "$CID" chown mssql:mssql /var/opt/mssql/data/AdventureWorksLT2012.mdf \
-            /var/opt/mssql/data/AdventureWorksLT2012.ldf
+          curl -fsSL "$MDF_URL" | docker exec -i "$CID" sh -c "cat > /var/opt/mssql/data/AdventureWorksLT2012.mdf"
+          curl -fsSL "$LDF_URL" | docker exec -i "$CID" sh -c "cat > /var/opt/mssql/data/AdventureWorksLT2012.ldf"
+          docker exec "$CID" ls -lh /var/opt/mssql/data/
 
       - name: Attach database (FOR ATTACH)
         run: |
