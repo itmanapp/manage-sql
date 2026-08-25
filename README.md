@@ -11,7 +11,9 @@ CI 已使用 **Microsoft 官方 AdventureWorksLT2012 範例 MDF** 在真實 SQL 
 | 需求 | 實作 |
 |---|---|
 | 讀取 MSSQL 資料庫（MDF 檔） | 透過 `pymssql` 連線 SQL Server；MDF 以 `FOR ATTACH` 方式載入（見下方） |
+| 多格式資料庫檔案 + 自動判別 | `backend: auto` 自動辨識 SQLite／Access(MDB/ACCDB)／dBASE(DBF)／SQL Server MDF |
 | 條件搜尋：姓名／身份證／地址／電話 | 參數化 LIKE 查詢，多條件 AND 結合，支援部分比對、分頁 |
+| 資料寫入 | 可讀寫格式提供網頁「新增一筆」與逐列「刪除」（含確認），唯讀格式自動隱藏 |
 | 離線登入認證 + TOTP | 本地 SQLite 帳號庫（PBKDF2-HMAC-SHA256），TOTP 依 RFC 6238 自行實作，零外部服務 |
 
 其他安全設計：
@@ -41,7 +43,7 @@ CI 已使用 **Microsoft 官方 AdventureWorksLT2012 範例 MDF** 在真實 SQL 
 │   └── smoke_test.sh       端對端煙霧測試
 ├── docker-compose.yml      離線可用的 SQL Server 2022 容器
 ├── .github/workflows/ci.yml  CI：真實 SQL Server 附加 MDF 的整合測試
-└── tests/                  單元測試、E2E 測試、MSSQL 整合測試
+└── tests/                  單元測試、E2E、多格式讀寫、MSSQL 整合測試
 ```
 
 ## 安裝
@@ -62,7 +64,7 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
-相依套件僅 3 個：`Flask`（網頁框架）、`PyYAML`（設定檔）、`pymssql`（SQL Server 驅動）。
+相依套件共 5 個：`Flask`（網頁框架）、`PyYAML`（設定檔）、`pymssql`（SQL Server 驅動）、`access-parser`（Access 唯讀解析）、`dbf`（dBASE 讀寫），皆為純 Python 或含預編譯 wheel。
 
 ### 快速開始（示範模式，SQLite）
 
@@ -75,6 +77,36 @@ cp config.yaml.example config.yaml        # 預設 backend: sqlite
 ```
 
 登入流程：輸入帳密 → 在驗證器 App（Google Authenticator、Aegis 等）以手動輸入方式新增剛才的 Base32 密鑰 → 輸入 6 位動態碼完成登入。
+
+## 支援格式與自動判別
+
+設定 `backend: auto` 並指定檔案路徑，系統會先以**魔術位元組＋標頭結構**判別檔案類型再載入：
+
+| 格式 | 常見副檔名 | 判別依據 | 讀取 | 寫入 |
+|---|---|---|---|---|
+| SQLite | `.db` `.sqlite` `.sqlite3` | 開頭魔術字串 `SQLite format 3` | ✅ | ✅ 新增／刪除 |
+| dBASE / FoxPro | `.dbf` | 版本旗標＋日期＋標頭長度結構 | ✅ | ✅ 新增／刪除 |
+| Microsoft Access (Jet) | `.mdb` | 偏移 4 的 `Standard Jet DB` | ✅ | ❌ 唯讀 |
+| Microsoft Access (ACE) | `.accdb` | 偏移 4 的 `Standard ACE DB` | ✅ | ❌ 唯讀 |
+| SQL Server 資料檔 | `.mdf` | 8KB 分頁對齊＋內容特徵 | 需先附加引擎 | 經 SQL Server 讀寫 |
+
+```yaml
+database:
+  backend: auto
+  file: data/sample.dbf     # 要載入的資料庫檔案
+  table: Members            # SQLite / Access 需指定資料表（DBF 為單表格式免設定）
+  encoding: utf-8           # DBF 編碼：utf-8 或 big5 (cp950)、gbk
+```
+
+- 登入後頁面頂部會顯示「已載入：〈格式〉（可讀寫／僅可讀）」橫幅
+- 不確定檔案內容時，可用管理工具判別：
+  ```bash
+  .venv/bin/python manage.py detect data/sample.dbf
+  # 會印出類型、可否寫入、可用資料表清單與建議設定方式
+  ```
+- DBF 中文亂碼時調整 `encoding`（台灣常用 `big5`）；DBF 為固定長度欄位，寫入超出欄位寬度會被拒絕並提示
+- Access 格式基於第三方解析器（access-parser）為唯讀；需要寫入時請先轉換為 SQLite
+- 選到 `.mdf` 時會引導改用 `backend: sqlserver`（需先附加至引擎）
 
 ## 正式環境：載入 MDF 檔
 
@@ -232,8 +264,9 @@ qrencode -o alice-totp.png "otpauth://totp/MdfQuery:alice?secret=..."   # 存成
 ### 本機測試
 
 ```bash
-.venv/bin/python -m unittest discover -s tests -p "test_*.py"   # 單元 + E2E 測試（15 例）
+.venv/bin/python -m unittest discover -s tests -p "test_*.py"   # 單元 + E2E + 多格式測試（37 例）
 ./scripts/smoke_test.sh                                          # 本機 HTTP 全流程煙霧測試（SQLite 示範模式）
+.venv/bin/python manage.py detect <檔案>                          # 判別任意資料庫檔案類型
 ```
 
 ### CI：真實 SQL Server + 官方 MDF 整合測試

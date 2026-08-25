@@ -4,6 +4,13 @@ server:
 
 database:
   backend: sqlite
+
+  # ── auto 模式：自動判別檔案類型（SQLite / DBF / MDB / ACCDB；MDF 請用 sqlserver）──
+  # backend: auto
+  # file: data/sample.dbf          # 資料庫檔案路徑
+  # table: Members                 # SQLite / Access 需指定資料表（DBF 為單表格式免設定）
+  # encoding: utf-8                # DBF 編碼：utf-8 或 big5 (cp950)
+
   sqlite:
     path: instance/demo.db
     table: Members

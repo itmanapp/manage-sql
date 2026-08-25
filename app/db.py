@@ -1,3 +1,4 @@
+import os
 import re
 
 FIELD_ORDER = ["name", "idcard", "address", "phone"]
@@ -55,11 +56,13 @@ def match_column(columns, candidates):
 
 class BaseBackend:
     param = "?"
+    can_write = True
 
     def __init__(self, cfg):
         self.cfg = cfg or {}
         self._columns = None
         self._mapping = None
+        self.detection = None
 
     def table_name(self):
         table = self.cfg.get("table")
@@ -69,6 +72,27 @@ class BaseBackend:
 
     def quote_ident(self, ident):
         raise NotImplementedError
+
+    def describe(self):
+        if self.detection is not None:
+            mark = "可讀寫" if self.can_write else "僅可讀"
+            return f"{self.detection.label}（{mark}）"
+        return type(self).__name__
+
+    def _field_pairs(self):
+        mapping = self.resolve_mapping()
+        return [(f, mapping[f]) for f in FIELD_ORDER if f in mapping]
+
+    @staticmethod
+    def _clean(value):
+        text = "" if value is None else str(value)
+        return text.strip()[:200]
+
+    def insert(self, values):
+        raise DatabaseError("此資料格式不支援寫入")
+
+    def delete(self, criteria):
+        raise DatabaseError("此資料格式不支援寫入")
 
     def columns(self):
         if self._columns is None:
@@ -127,6 +151,13 @@ class BaseBackend:
 
 class SqlServerBackend(BaseBackend):
     param = "%s"
+
+    def describe(self):
+        base = f"SQL Server 資料庫 {self.cfg.get('database', '')}（經引擎連線）"
+        if self.detection is not None:
+            mark = "可讀寫" if self.can_write else "僅可讀"
+            return f"{self.detection.label} · {base}（{mark}）"
+        return base
 
     def _connect(self):
         try:
@@ -207,6 +238,44 @@ class SqlServerBackend(BaseBackend):
             rows = [dict(zip(names, row)) for row in cur.fetchall()]
         return rows, total
 
+    def _qualified_insert_target(self):
+        return self._qualified_table()
+
+    def insert(self, values):
+        pairs = self._field_pairs()
+        cols = ", ".join(self.quote_ident(col) for _, col in pairs)
+        marks = ", ".join(self.param for _ in pairs)
+        params = [self._clean(values.get(field)) for field, _ in pairs]
+        sql = (
+            f"INSERT INTO {self._qualified_insert_target()} ({cols})"
+            f" VALUES ({marks})"
+        )
+        with self._connect() as conn:
+            cur = conn.cursor(as_dict=False)
+            cur.execute(sql, tuple(params))
+            return cur.rowcount
+
+    def delete(self, criteria):
+        pairs = self._field_pairs()
+        clauses = []
+        params = []
+        for field, col in pairs:
+            value = criteria.get(field)
+            if value is None:
+                continue
+            if str(value).strip() == "":
+                clauses.append(f"{self.quote_ident(col)} IS NULL")
+            else:
+                clauses.append(f"{self.quote_ident(col)} = {self.param}")
+                params.append(str(value))
+        if not clauses:
+            raise DatabaseError("刪除條件不可為空，請至少提供一個欄位值")
+        sql = f"DELETE FROM {self._qualified_table()} WHERE " + " AND ".join(clauses)
+        with self._connect() as conn:
+            cur = conn.cursor(as_dict=False)
+            cur.execute(sql, tuple(params))
+            return cur.rowcount
+
 
 class SqliteBackend(BaseBackend):
     param = "?"
@@ -261,6 +330,43 @@ class SqliteBackend(BaseBackend):
             rows = [dict(zip(names, row)) for row in cur.fetchall()]
         return rows, total
 
+    def insert(self, values):
+        pairs = self._field_pairs()
+        table = self.quote_ident(self.table_name().strip('"'))
+        cols = ", ".join(self.quote_ident(col) for _, col in pairs)
+        marks = ", ".join("?" for _ in pairs)
+        params = [self._clean(values.get(field)) for field, _ in pairs]
+        with self._connect() as conn:
+            cur = conn.execute(
+                f"INSERT INTO {table} ({cols}) VALUES ({marks})", tuple(params)
+            )
+            conn.commit()
+            return cur.rowcount
+
+    def delete(self, criteria):
+        pairs = self._field_pairs()
+        table = self.quote_ident(self.table_name().strip('"'))
+        clauses = []
+        params = []
+        for field, col in pairs:
+            value = criteria.get(field)
+            if value is None:
+                continue
+            qcol = self.quote_ident(col)
+            if str(value).strip() == "":
+                clauses.append(f"({qcol} IS NULL OR {qcol} = '')")
+            else:
+                clauses.append(f"{qcol} = ?")
+                params.append(str(value))
+        if not clauses:
+            raise DatabaseError("刪除條件不可為空，請至少提供一個欄位值")
+        with self._connect() as conn:
+            cur = conn.execute(
+                f"DELETE FROM {table} WHERE " + " AND ".join(clauses), tuple(params)
+            )
+            conn.commit()
+            return cur.rowcount
+
     def seed_demo(self):
         import os
         import sqlite3
@@ -299,6 +405,238 @@ class SqliteBackend(BaseBackend):
         return inserted
 
 
+class DbfFileBackend(BaseBackend):
+    can_write = True
+    _CODEPAGES = {
+        "utf-8": 240,
+        "utf8": 240,
+        "big5": 120,
+        "cp950": 120,
+        "gbk": 77,
+        "cp936": 77,
+        "ascii": 0,
+    }
+
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        self.path = cfg.get("path")
+        if not self.path:
+            raise DatabaseError("config.yaml 缺少檔案路徑：file")
+        enc = str(cfg.get("encoding", "utf-8")).lower()
+        codepage = self._CODEPAGES.get(enc)
+        if codepage is None:
+            raise DatabaseError(
+                f"不支援的 DBF 編碼：{enc}（可用：utf-8、big5/cp950、gbk）"
+            )
+        self.codepage = codepage
+
+    def table_name(self):
+        return os.path.splitext(os.path.basename(self.path))[0]
+
+    def quote_ident(self, ident):
+        return str(ident)
+
+    def _open(self, write=False):
+        try:
+            import dbf as dbflib
+        except ImportError as exc:
+            raise DatabaseError("未安裝 dbf 套件，請先執行 pip install -r requirements.txt") from exc
+        mode = dbflib.READ_WRITE if write else dbflib.READ_ONLY
+        try:
+            table = dbflib.Table(self.path, codepage=self.codepage)
+            table.open(mode=mode)
+            return table
+        except Exception as exc:
+            raise DatabaseError(f"無法開啟 DBF 檔：{exc}") from exc
+
+    @staticmethod
+    def _cell(value):
+        if isinstance(value, (bytes, bytearray)):
+            value = value.decode("utf-8", "replace")
+        if isinstance(value, str):
+            return value.strip()
+        return "" if value is None else str(value)
+
+    def _fetch_columns(self):
+        table = self._open()
+        try:
+            cols = list(table.field_names)
+        finally:
+            table.close()
+        if not cols:
+            raise DatabaseError("DBF 檔沒有任何欄位")
+        return cols
+
+    def search(self, criteria, page, page_size):
+        mapping = self.resolve_mapping()
+        wanted = {
+            field: str(criteria[field]).strip().lower()
+            for field in FIELD_ORDER
+            if criteria.get(field) and field in mapping
+        }
+        rows = []
+        total = 0
+        offset = (page - 1) * page_size
+        table = self._open()
+        try:
+            names = [c for c in table.field_names]
+            for record in table:
+                row = {name: self._cell(record[name]) for name in names}
+                if all(
+                    wanted[f] in str(row.get(mapping[f], "")).lower()
+                    for f in wanted
+                ):
+                    total += 1
+                    if offset <= (total - 1) < offset + page_size:
+                        rows.append({mapping[f]: row.get(mapping[f]) for f in FIELD_ORDER if f in mapping})
+        finally:
+            table.close()
+        return rows, total
+
+    def insert(self, values):
+        pairs = self._field_pairs()
+        data = tuple(self._clean(values.get(field)) for field, _ in pairs)
+        table = self._open(write=True)
+        try:
+            table.append(data)
+            return 1
+        except Exception as exc:
+            raise DatabaseError(f"寫入 DBF 失敗（欄位長度或型別不符？）：{exc}") from exc
+        finally:
+            table.close()
+
+    def delete(self, criteria):
+        import dbf as dbflib
+
+        pairs = self._field_pairs()
+        wanted = {}
+        for field, col in pairs:
+            value = criteria.get(field)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text == "":
+                wanted[col] = ""
+            else:
+                wanted[col] = text
+        if not wanted:
+            raise DatabaseError("刪除條件不可為空，請至少提供一個欄位值")
+        table = self._open(write=True)
+        removed = 0
+        try:
+            for record in list(table):
+                current = {col: self._cell(record[col]) for col in wanted}
+                if all(current[col] == val for col, val in wanted.items()):
+                    dbflib.delete(record)
+                    removed += 1
+            if removed:
+                table.pack()
+            return removed
+        except Exception as exc:
+            raise DatabaseError(f"刪除 DBF 記錄失敗：{exc}") from exc
+        finally:
+            table.close()
+
+
+class AccessFileBackend(BaseBackend):
+    can_write = False
+
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        self.path = cfg.get("path")
+        if not self.path:
+            raise DatabaseError("config.yaml 缺少檔案路徑：file")
+        self._rows = None
+
+    def _parser(self):
+        try:
+            from access_parser import AccessParser
+        except ImportError as exc:
+            raise DatabaseError(
+                "未安裝 access-parser 套件，請先執行 pip install -r requirements.txt"
+            ) from exc
+        try:
+            return AccessParser(self.path)
+        except Exception as exc:
+            raise DatabaseError(f"無法解析 Access 檔：{exc}") from exc
+
+    def tables(self):
+        parser = self._parser()
+        try:
+            return sorted(parser.catalog.keys())
+        except Exception as exc:
+            raise DatabaseError(f"無法列舉 Access 資料表：{exc}") from exc
+
+    def table_name(self):
+        table = self.cfg.get("table")
+        if not table:
+            available = ", ".join(self.tables()) or "(無)"
+            raise DatabaseError(
+                f"請於設定指定 database.table；此 Access 檔可用資料表：{available}"
+            )
+        return table
+
+    def quote_ident(self, ident):
+        return str(ident)
+
+    def _load_rows(self):
+        if self._rows is not None:
+            return self._rows
+        parser = self._parser()
+        name = self.table_name()
+        try:
+            parsed = parser.parse_table(name)
+        except Exception as exc:
+            raise DatabaseError(f"讀取 Access 資料表 {name} 失敗：{exc}") from exc
+        if not parsed:
+            raise DatabaseError(f"Access 資料表 {name} 是空的或無法解析")
+        cols = list(parsed.keys())
+        count = max(len(v) for v in parsed.values())
+        self._rows = [
+            {
+                col: (
+                    parsed[col][idx]
+                    if idx < len(parsed[col])
+                    else None
+                )
+                for col in cols
+            }
+            for idx in range(count)
+        ]
+        return self._rows
+
+    def _fetch_columns(self):
+        return list(self._load_rows()[0].keys()) if self._load_rows() else []
+
+    def search(self, criteria, page, page_size):
+        mapping = self.resolve_mapping()
+        wanted = {
+            field: str(criteria[field]).strip().lower()
+            for field in FIELD_ORDER
+            if criteria.get(field) and field in mapping
+        }
+        matched = []
+        for row in self._load_rows():
+            if all(
+                wanted[f] in str(row.get(mapping[f], "")).lower()
+                for f in wanted
+            ):
+                matched.append(row)
+        offset = (page - 1) * page_size
+        sliced = matched[offset:offset + page_size]
+        rows = [
+            {mapping[f]: r.get(mapping[f]) for f in FIELD_ORDER if f in mapping}
+            for r in sliced
+        ]
+        return rows, len(matched)
+
+    def insert(self, values):
+        raise DatabaseError("Microsoft Access 格式為唯讀，不支援寫入")
+
+    def delete(self, criteria):
+        raise DatabaseError("Microsoft Access 格式為唯讀，不支援寫入")
+
+
 _BACKENDS = {
     "sqlserver": SqlServerBackend,
     "mssql": SqlServerBackend,
@@ -309,6 +647,36 @@ _BACKENDS = {
 def create_backend(db_cfg, search_columns=None):
     db_cfg = dict(db_cfg or {})
     name = str(db_cfg.get("backend", "sqlite")).lower()
+
+    if name == "auto":
+        from .dbdetect import detect_database
+
+        file_path = db_cfg.get("file")
+        if not file_path:
+            raise DatabaseError("backend: auto 需要 database.file 設定（資料庫檔案路徑）")
+        detection = detect_database(file_path)
+        section = {
+            "path": file_path,
+            "table": db_cfg.get("table"),
+            "encoding": db_cfg.get("encoding", "utf-8"),
+        }
+        explicit = {k: v for k, v in (search_columns or {}).items() if v}
+        if explicit:
+            section["columns"] = explicit
+        if detection.file_type == "sqlite":
+            backend = SqliteBackend(section)
+        elif detection.file_type == "dbf":
+            backend = DbfFileBackend(section)
+        elif detection.file_type in ("mdb", "accdb"):
+            backend = AccessFileBackend(section)
+        else:
+            raise DatabaseError(
+                f"偵測到 {detection.label}。MDF 需先附加至 SQL Server 引擎才能存取，"
+                "請改設定 backend: sqlserver（參見 README「正式環境：載入 MDF 檔」章節）"
+            )
+        backend.detection = detection
+        return backend
+
     cls = _BACKENDS.get(name)
     if cls is None:
         raise DatabaseError(f"未知資料庫後端：{name}")
@@ -317,4 +685,15 @@ def create_backend(db_cfg, search_columns=None):
     explicit = {k: v for k, v in (search_columns or {}).items() if v}
     if explicit:
         section["columns"] = explicit
-    return cls(section)
+    backend = cls(section)
+    if isinstance(backend, SqlServerBackend):
+        from .dbdetect import Detection
+
+        backend.detection = Detection(
+            "sqlserver", "SQL Server 資料庫", True
+        )
+    else:
+        from .dbdetect import Detection
+
+        backend.detection = Detection("sqlite", "SQLite 資料庫", True)
+    return backend

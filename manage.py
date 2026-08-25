@@ -76,6 +76,46 @@ def cmd_seed_demo(_args):
     print(f"示範資料就緒：instance/demo.db（資料表 Members，本次新增 {count} 筆虛構資料）")
 
 
+def cmd_detect(args):
+    from app.dbdetect import detect_database
+
+    try:
+        det = detect_database(args.file)
+    except FileNotFoundError as exc:
+        sys.exit(str(exc))
+    except ValueError as exc:
+        sys.exit(str(exc))
+    print(f"檔案：{args.file}")
+    print(f"類型：{det.label}（{det.file_type}）")
+    print(f"寫入：{'支援' if det.writable else '不支援'}")
+    if det.note:
+        print(f"備註：{det.note}")
+    if det.file_type == "sqlite":
+        import sqlite3
+
+        with sqlite3.connect(args.file) as conn:
+            rows = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+                " AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            ).fetchall()
+        names = [r[0] for r in rows]
+        print(f"資料表：{', '.join(names) if names else '(無)'}")
+        print("設定方式：database.backend: auto + database.file 指向此檔，並填 database.table")
+    elif det.file_type in ("mdb", "accdb"):
+        from access_parser import AccessParser
+
+        parser = AccessParser(args.file)
+        tables = sorted(parser.catalog.keys())
+        print(f"資料表：{', '.join(tables) if tables else '(無)'}")
+        print("設定方式：database.backend: auto + database.file 指向此檔，並填 database.table")
+    elif det.file_type == "dbf":
+        print("說明：DBF 為單表格式，無需設定 table；如中文亂碼請調整 database.encoding（utf-8 / big5）")
+        print("設定方式：database.backend: auto + database.file 指向此檔")
+    elif det.file_type == "mdf":
+        print("說明：MDF 需先由 SQL Server 引擎附加後才能存取")
+        print("設定方式：docker compose up -d 後執行 scripts/attach_mdf.sh，再將 config.yaml 設 backend: sqlserver")
+
+
 def main():
     parser = argparse.ArgumentParser(description="MDF 查詢系統管理工具")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -96,6 +136,10 @@ def main():
 
     p_demo = sub.add_parser("seed-demo", help="寫入 SQLite 示範資料")
     p_demo.set_defaults(func=cmd_seed_demo)
+
+    p_detect = sub.add_parser("detect", help="判別資料庫檔案類型與可用資料表")
+    p_detect.add_argument("file")
+    p_detect.set_defaults(func=cmd_detect)
 
     args = parser.parse_args()
     os.chdir(BASE_DIR)

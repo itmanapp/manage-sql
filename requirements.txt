@@ -1,3 +1,5 @@
 Flask>=3.1,<4
 PyYAML>=6.0.2
 pymssql>=2.3.2
+access-parser>=0.0.6
+dbf>=0.99.11

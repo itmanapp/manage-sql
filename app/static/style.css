@@ -84,6 +84,8 @@ input:focus { outline: 2px solid var(--primary); outline-offset: 0; border-color
 }
 .btn-primary { background: var(--primary); border-color: var(--primary-dark); color: #fff; }
 .btn-primary:hover { background: var(--primary-dark); }
+.btn-danger { background: #fff; border-color: #e2b6b2; color: var(--danger); }
+.btn-danger:hover { background: var(--danger-bg); }
 .btn-ghost:hover { background: var(--bg); }
 .btn-sm { padding: 5px 12px; font-size: .85rem; color: #fff; background: transparent; border-color: rgba(255,255,255,.45); }
 .btn-block { width: 100%; margin-top: 18px; }
@@ -136,3 +138,13 @@ input:focus { outline: 2px solid var(--primary); outline-offset: 0; border-color
 }
 .pager a:hover { background: var(--bg); }
 .pager .cur { background: var(--primary); color: #fff; border-color: var(--primary-dark); }
+
+.add-card summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--primary);
+}
+.add-card[open] summary { margin-bottom: 8px; }
+
+.op-col { width: 70px; text-align: center; white-space: nowrap; }
+td.op-col { padding: 6px 10px; }
