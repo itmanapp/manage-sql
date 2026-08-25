@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}資料查詢系統{% endblock %}</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header class="topbar">
+  <div class="wrap bar-inner">
+    <span class="brand">MSSQL 資料查詢系統</span>
+    {% if session.get('user') %}
+    <div class="bar-right">
+      <span class="who">使用者：{{ session['user'] }}</span>
+      <form method="post" action="{{ url_for('auth.logout') }}" class="inline">
+        <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+        <button type="submit" class="btn btn-ghost btn-sm">登出</button>
+      </form>
+    </div>
+    {% endif %}
+  </div>
+</header>
+<main class="wrap main">
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% for category, text in messages %}
+    <div class="alert alert-{{ category }}">{{ text }}</div>
+  {% endfor %}
+{% endwith %}
+{% block content %}{% endblock %}
+</main>
+<footer class="footer">
+  <div class="wrap">離線內部系統 · 帳號密碼 + TOTP 兩階段驗證（RFC 6238）</div>
+</footer>
+</body>
+</html>

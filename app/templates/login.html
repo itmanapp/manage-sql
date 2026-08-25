@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}登入 · 資料查詢系統{% endblock %}
+{% block content %}
+<div class="card card-narrow">
+  <h1>系統登入</h1>
+  <p class="muted">第一步：輸入帳號與密碼，下一步將要求動態驗證碼。</p>
+  <form method="post" action="{{ url_for('auth.login') }}">
+    <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+    <label for="username">帳號</label>
+    <input id="username" name="username" type="text"
+           autocomplete="username" required autofocus
+           value="{{ request.form.get('username', '') }}">
+    <label for="password">密碼</label>
+    <input id="password" name="password" type="password"
+           autocomplete="current-password" required>
+    <button type="submit" class="btn btn-primary btn-block">下一步</button>
+  </form>
+</div>
+{% endblock %}

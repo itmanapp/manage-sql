@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run unit and e2e tests
+        run: python -m unittest discover -s tests -p "test_*.py" -v
+
+  integration-mssql:
+    runs-on: ubuntu-latest
+    services:
+      mssql:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_SA_PASSWORD: "YourStrong!Passw0rd"
+          MSSQL_PID: Developer
+        ports:
+          - 11433:1433
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P YourStrong!Passw0rd -Q 'SELECT 1'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      MSSQL_HOST: 127.0.0.1
+      MSSQL_PORT: "11433"
+      MSSQL_SA_PASSWORD: "YourStrong!Passw0rd"
+      MSSQL_DATABASE: AdventureWorksLT2012
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download official sample MDF/LDF (AdventureWorksLT2012)
+        run: |
+          mkdir -p data
+          curl -fsSL -o data/AdventureWorksLT2012.mdf \
+            https://github.com/Microsoft/sql-server-samples/releases/download/adventureworks2012/adventure-works-2012-oltp-lt-data-file.mdf
+          curl -fsSL -o data/AdventureWorksLT2012.ldf \
+            https://github.com/Microsoft/sql-server-samples/releases/download/adventureworks2012/adventure-works-2012-oltp-lt-log-file.ldf
+          ls -lh data/
+
+      - name: Copy MDF/LDF into SQL Server container
+        run: |
+          CID=$(docker ps -q --filter name=mssql)
+          echo "container: $CID"
+          docker cp data/AdventureWorksLT2012.mdf "$CID":/var/opt/mssql/data/
+          docker cp data/AdventureWorksLT2012.ldf "$CID":/var/opt/mssql/data/
+          docker exec "$CID" chown mssql:mssql /var/opt/mssql/data/AdventureWorksLT2012.mdf \
+            /var/opt/mssql/data/AdventureWorksLT2012.ldf
+
+      - name: Attach database (FOR ATTACH)
+        run: |
+          CID=$(docker ps -q --filter name=mssql)
+          docker exec "$CID" /opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa \
+            -P 'YourStrong!Passw0rd' -Q "CREATE DATABASE [AdventureWorksLT2012] ON (FILENAME = '/var/opt/mssql/data/AdventureWorksLT2012.mdf'), (FILENAME = '/var/opt/mssql/data/AdventureWorksLT2012.ldf') FOR ATTACH"
+
+      - name: Seed searchable Members table from attached MDF data
+        run: |
+          CID=$(docker ps -q --filter name=mssql)
+          docker cp scripts/seed_members.sql "$CID":/tmp/seed_members.sql
+          docker exec "$CID" /opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa \
+            -P 'YourStrong!Passw0rd' -d AdventureWorksLT2012 -i /tmp/seed_members.sql
+          docker exec "$CID" /opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa \
+            -P 'YourStrong!Passw0rd' -d AdventureWorksLT2012 -Q "SELECT COUNT(*) AS members FROM dbo.Members"
+
+      - name: Run full-stack test against real SQL Server + MDF
+        run: python tests/ci_integration.py

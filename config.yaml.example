@@ -1,0 +1,24 @@
+server:
+  host: 127.0.0.1
+  port: 8000
+
+database:
+  backend: sqlite
+  sqlite:
+    path: instance/demo.db
+    table: Members
+  sqlserver:
+    host: 127.0.0.1
+    port: 1433
+    user: sa
+    password: "YourStrong!Passw0rd"
+    database: MemberData
+    table: dbo.Members
+
+search:
+  page_size: 20
+  columns:
+    name: null
+    idcard: null
+    address: null
+    phone: null

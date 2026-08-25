@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}兩階段驗證 · 資料查詢系統{% endblock %}
+{% block content %}
+<div class="card card-narrow">
+  <h1>兩階段驗證</h1>
+  <p class="muted">{{ username }}，請輸入驗證器 App 目前顯示的 6 位數動態碼。</p>
+  <form method="post" action="{{ url_for('auth.totp_step') }}" autocomplete="off">
+    <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+    <label for="code">動態驗證碼（TOTP）</label>
+    <input id="code" name="code" inputmode="numeric" pattern="[0-9 ]*"
+           maxlength="7" autocomplete="one-time-code" required autofocus
+           class="code-input" placeholder="000000">
+    <button type="submit" class="btn btn-primary btn-block">驗證並登入</button>
+  </form>
+  <p class="muted small">代碼每 30 秒更新一次，同一組代碼只能使用一次。</p>
+</div>
+{% endblock %}

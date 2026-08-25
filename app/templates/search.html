@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}條件查詢 · 資料查詢系統{% endblock %}
+{% block content %}
+<h1>會員資料條件查詢</h1>
+
+<form method="get" action="{{ url_for('search.index') }}" class="card search-form">
+  <div class="grid">
+    {% for field in fields %}
+      {% if field in mapping %}
+      <div class="field">
+        <label for="{{ field }}">{{ labels[field] }}<span class="colname">{{ mapping[field] }}</span></label>
+        <input id="{{ field }}" name="{{ field }}" value="{{ criteria.get(field, '') }}"
+               placeholder="部分比對（包含關鍵字）" maxlength="100">
+      </div>
+      {% endif %}
+    {% endfor %}
+  </div>
+  <div class="actions">
+    <button type="submit" class="btn btn-primary">搜尋</button>
+    <a href="{{ url_for('search.index') }}" class="btn btn-ghost">清除條件</a>
+  </div>
+</form>
+
+{% if error %}<div class="alert alert-error">{{ error }}</div>{% endif %}
+{% if warning and not error %}<div class="alert alert-info">{{ warning }}</div>{% endif %}
+
+{% if total is not none %}
+<div class="result-meta">
+  符合條件共 <strong>{{ total }}</strong> 筆　·　第 {{ page }} / {{ pages }} 頁（每頁 {{ page_size }} 筆）
+</div>
+<table class="result-table">
+  <thead>
+    <tr>
+      {% for field in fields %}{% if field in mapping %}<th>{{ labels[field] }}</th>{% endif %}{% endfor %}
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in rows %}
+    <tr>
+      {% for field in fields %}{% if field in mapping %}
+      <td>{{ row[mapping[field]] if row[mapping[field]] is not none else '—' }}</td>
+      {% endif %}{% endfor %}
+    </tr>
+    {% else %}
+    <tr><td colspan="4" class="empty">查無符合條件的資料</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+{% if pages > 1 %}
+{% set start = [1, page - 4]|max %}
+{% set end = [pages, page + 4]|min %}
+<nav class="pager">
+  {% if start > 1 %}<a href="{{ url_for('search.index', page=1, **criteria) }}">1…</a>{% endif %}
+  {% for p in range(start, end + 1) %}
+    {% if p == page %}<span class="cur">{{ p }}</span>
+    {% else %}<a href="{{ url_for('search.index', page=p, **criteria) }}">{{ p }}</a>{% endif %}
+  {% endfor %}
+  {% if end < pages %}<a href="{{ url_for('search.index', page=pages, **criteria) }}">…{{ pages }}</a>{% endif %}
+</nav>
+{% endif %}
+{% elif not error %}
+<div class="card hint-card">請至少填寫一個搜尋條件後按下「搜尋」。</div>
+{% endif %}
+{% endblock %}
