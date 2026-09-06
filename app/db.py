@@ -57,11 +57,14 @@ def match_column(columns, candidates):
 class BaseBackend:
     param = "?"
     can_write = True
+    keyset = False
+    slow_warning = None
 
     def __init__(self, cfg):
         self.cfg = cfg or {}
         self._columns = None
         self._mapping = None
+        self._pk_cache = None
         self.detection = None
 
     def table_name(self):
@@ -91,13 +94,25 @@ class BaseBackend:
     def insert(self, values):
         raise DatabaseError("此資料格式不支援寫入")
 
-    def delete(self, criteria):
+    def delete(self, criteria, pk=None):
         raise DatabaseError("此資料格式不支援寫入")
 
     def columns(self):
         if self._columns is None:
             self._columns = self._fetch_columns()
         return self._columns
+
+    def pk_columns(self):
+        """回傳主鍵欄位清單；無主鍵或無法偵測時回傳 []。"""
+        return []
+
+    def _search_columns(self, mapping):
+        """查詢時 SELECT 的欄位：對應欄位 + 主鍵（供精準刪除）。"""
+        cols = [mapping[f] for f in FIELD_ORDER if f in mapping]
+        for pk in self.pk_columns():
+            if pk not in cols:
+                cols.append(pk)
+        return cols
 
     def resolve_mapping(self):
         if self._mapping is not None:
@@ -142,7 +157,7 @@ class BaseBackend:
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         return where, params
 
-    def search(self, criteria, page, page_size):
+    def search(self, criteria, page, page_size, after=None, before=None):
         raise NotImplementedError
 
     def seed_demo(self):
@@ -151,6 +166,7 @@ class BaseBackend:
 
 class SqlServerBackend(BaseBackend):
     param = "%s"
+    keyset = True
 
     def describe(self):
         base = f"SQL Server 資料庫 {self.cfg.get('database', '')}（經引擎連線）"
@@ -214,28 +230,83 @@ class SqlServerBackend(BaseBackend):
         schema, name = self._split_table(self.table_name())
         return f"{self.quote_ident(schema)}.{self.quote_ident(name)}"
 
-    def search(self, criteria, page, page_size):
+    def _pk_columns(self):
+        if self._pk_cache is None:
+            schema, name = self._split_table(self.table_name())
+            sql = (
+                "SELECT k.COLUMN_NAME"
+                " FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE k"
+                " JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS t"
+                "   ON t.TABLE_SCHEMA = k.TABLE_SCHEMA"
+                "  AND t.TABLE_NAME = k.TABLE_NAME"
+                "  AND t.CONSTRAINT_NAME = k.CONSTRAINT_NAME"
+                " WHERE t.CONSTRAINT_TYPE = 'PRIMARY KEY'"
+                "   AND k.TABLE_SCHEMA = %s AND k.TABLE_NAME = %s"
+                " ORDER BY k.ORDINAL_POSITION"
+            )
+            try:
+                with self._connect() as conn:
+                    cur = conn.cursor()
+                    cur.execute(sql, (schema, name))
+                    self._pk_cache = [row[0] for row in cur.fetchall()]
+            except DatabaseError:
+                # 無法偵測主鍵時退回全欄位比對刪除
+                self._pk_cache = []
+        return self._pk_cache
+
+    def pk_columns(self):
+        return self._pk_columns()
+
+    @staticmethod
+    def _keyed_where(order_col, after, before, where, params):
+        """keyset 分頁條件；回傳 (data_where, params, descending)。"""
+        descending = before is not None
+        if before is not None:
+            where += f" AND {order_col} < {SqlServerBackend.param}"
+            params.append(before)
+        elif after is not None:
+            where += f" AND {order_col} > {SqlServerBackend.param}"
+            params.append(after)
+        return where, params, descending
+
+    def search(self, criteria, page, page_size, after=None, before=None):
         mapping = self.resolve_mapping()
-        where, params = self.build_where(mapping, criteria)
+        base_where, base_params = self.build_where(mapping, criteria)
         table = self._qualified_table()
         select_cols = ", ".join(
-            self.quote_ident(mapping[f]) for f in FIELD_ORDER if f in mapping
+            self.quote_ident(c) for c in self._search_columns(mapping)
         )
-        order_col = self.quote_ident(mapping.get("idcard") or next(iter(mapping.values())))
+        order_col = self.quote_ident(
+            mapping.get("idcard") or next(iter(mapping.values()))
+        )
+        page_size = int(page_size)
         offset = (page - 1) * page_size
-        count_sql = f"SELECT COUNT(*) FROM {table}{where}"
-        data_sql = (
-            f"SELECT {select_cols} FROM {table}{where}"
-            f" ORDER BY {order_col}"
-            f" OFFSET {int(offset)} ROWS FETCH NEXT {int(page_size)} ROWS ONLY"
-        )
+        count_sql = f"SELECT COUNT(*) FROM {table}{base_where}"
+        if after is not None or before is not None:
+            data_where, params, descending = self._keyed_where(
+                order_col, after, before, base_where, list(base_params)
+            )
+            data_sql = (
+                f"SELECT {select_cols} FROM {table}{data_where}"
+                f" ORDER BY {order_col} {'DESC' if descending else 'ASC'}"
+                f" OFFSET 0 ROWS FETCH NEXT {page_size} ROWS ONLY"
+            )
+        else:
+            data_where, params, descending = base_where, base_params, False
+            data_sql = (
+                f"SELECT {select_cols} FROM {table}{data_where}"
+                f" ORDER BY {order_col}"
+                f" OFFSET {int(offset)} ROWS FETCH NEXT {page_size} ROWS ONLY"
+            )
         with self._connect() as conn:
             cur = conn.cursor(as_dict=False)
-            cur.execute(count_sql, tuple(params))
+            cur.execute(count_sql, tuple(base_params))
             total = cur.fetchone()[0]
             cur.execute(data_sql, tuple(params))
             names = [d[0] for d in cur.description]
             rows = [dict(zip(names, row)) for row in cur.fetchall()]
+            if descending:
+                rows.reverse()
         return rows, total
 
     def _qualified_insert_target(self):
@@ -255,7 +326,11 @@ class SqlServerBackend(BaseBackend):
             cur.execute(sql, tuple(params))
             return cur.rowcount
 
-    def delete(self, criteria):
+    def delete(self, criteria, pk=None):
+        table = self._qualified_table()
+        pk_cols = self._pk_columns()
+        if pk is not None and pk_cols:
+            return self._delete_by_pk(table, pk_cols, pk)
         pairs = self._field_pairs()
         clauses = []
         params = []
@@ -270,7 +345,23 @@ class SqlServerBackend(BaseBackend):
                 params.append(str(value))
         if not clauses:
             raise DatabaseError("刪除條件不可為空，請至少提供一個欄位值")
-        sql = f"DELETE FROM {self._qualified_table()} WHERE " + " AND ".join(clauses)
+        sql = f"DELETE FROM {table} WHERE " + " AND ".join(clauses)
+        with self._connect() as conn:
+            cur = conn.cursor(as_dict=False)
+            cur.execute(sql, tuple(params))
+            return cur.rowcount
+
+    def _delete_by_pk(self, table, pk_cols, pk):
+        clauses = []
+        params = []
+        for col in pk_cols:
+            value = pk.get(col)
+            if value is None or str(value).strip() == "":
+                clauses.append(f"{self.quote_ident(col)} IS NULL")
+            else:
+                clauses.append(f"{self.quote_ident(col)} = {self.param}")
+                params.append(str(value))
+        sql = f"DELETE FROM {table} WHERE " + " AND ".join(clauses)
         with self._connect() as conn:
             cur = conn.cursor(as_dict=False)
             cur.execute(sql, tuple(params))
@@ -279,6 +370,7 @@ class SqlServerBackend(BaseBackend):
 
 class SqliteBackend(BaseBackend):
     param = "?"
+    keyset = True
 
     def _connect(self):
         import os
@@ -308,26 +400,61 @@ class SqliteBackend(BaseBackend):
             raise DatabaseError(f"找不到資料表 {table} 或其中沒有欄位")
         return cols
 
-    def search(self, criteria, page, page_size):
+    def _pk_columns(self):
+        if self._pk_cache is None:
+            table = self.table_name().strip('"')
+            with self._connect() as conn:
+                rows = conn.execute(
+                    f"PRAGMA table_info({self.quote_ident(table)})"
+                ).fetchall()
+            self._pk_cache = [r["name"] for r in rows if r["pk"] > 0]
+        return self._pk_cache
+
+    def pk_columns(self):
+        return self._pk_columns()
+
+    def search(self, criteria, page, page_size, after=None, before=None):
         mapping = self.resolve_mapping()
-        where, params = self.build_where(mapping, criteria)
+        base_where, base_params = self.build_where(mapping, criteria)
         table = self.quote_ident(self.table_name().strip('"'))
         select_cols = ", ".join(
-            self.quote_ident(mapping[f]) for f in FIELD_ORDER if f in mapping
+            self.quote_ident(c) for c in self._search_columns(mapping)
         )
-        order_col = self.quote_ident(mapping.get("idcard") or next(iter(mapping.values())))
-        offset = (page - 1) * page_size
-        count_sql = f"SELECT COUNT(*) FROM {table}{where}"
-        data_sql = (
-            f"SELECT {select_cols} FROM {table}{where}"
-            f" ORDER BY {order_col} LIMIT {int(page_size)} OFFSET {int(offset)}"
+        order_col = self.quote_ident(
+            mapping.get("idcard") or next(iter(mapping.values()))
         )
+        page_size = int(page_size)
+        count_sql = f"SELECT COUNT(*) FROM {table}{base_where}"
+        if after is not None or before is not None:
+            descending = before is not None
+            data_where = base_where
+            params = list(base_params)
+            if before is not None:
+                data_where += f" AND {order_col} < ?"
+                params.append(before)
+            else:
+                data_where += f" AND {order_col} > ?"
+                params.append(after)
+            data_sql = (
+                f"SELECT {select_cols} FROM {table}{data_where}"
+                f" ORDER BY {order_col} {'DESC' if descending else 'ASC'}"
+                f" LIMIT {page_size}"
+            )
+        else:
+            offset = (page - 1) * page_size
+            data_where, params, descending = base_where, base_params, False
+            data_sql = (
+                f"SELECT {select_cols} FROM {table}{data_where}"
+                f" ORDER BY {order_col} LIMIT {page_size} OFFSET {int(offset)}"
+            )
         with self._connect() as conn:
-            cur = conn.execute(count_sql, tuple(params))
+            cur = conn.execute(count_sql, tuple(base_params))
             total = cur.fetchone()[0]
             cur = conn.execute(data_sql, tuple(params))
             names = [d[0] for d in cur.description]
             rows = [dict(zip(names, row)) for row in cur.fetchall()]
+            if descending:
+                rows.reverse()
         return rows, total
 
     def insert(self, values):
@@ -343,9 +470,26 @@ class SqliteBackend(BaseBackend):
             conn.commit()
             return cur.rowcount
 
-    def delete(self, criteria):
-        pairs = self._field_pairs()
+    def delete(self, criteria, pk=None):
         table = self.quote_ident(self.table_name().strip('"'))
+        pk_cols = self._pk_columns()
+        if pk is not None and pk_cols:
+            clauses = []
+            params = []
+            for col in pk_cols:
+                value = pk.get(col)
+                qcol = self.quote_ident(col)
+                if value is None or str(value).strip() == "":
+                    clauses.append(f"{qcol} IS NULL")
+                else:
+                    clauses.append(f"{qcol} = ?")
+                    params.append(str(value))
+            sql = f"DELETE FROM {table} WHERE " + " AND ".join(clauses)
+            with self._connect() as conn:
+                cur = conn.execute(sql, tuple(params))
+                conn.commit()
+                return cur.rowcount
+        pairs = self._field_pairs()
         clauses = []
         params = []
         for field, col in pairs:
@@ -416,6 +560,7 @@ class DbfFileBackend(BaseBackend):
         "cp936": 77,
         "ascii": 0,
     }
+    _CACHE_SIZE_LIMIT = 15 * 1024 * 1024  # 大於 15MB 提示首次查詢較慢
 
     def __init__(self, cfg):
         super().__init__(cfg)
@@ -429,6 +574,29 @@ class DbfFileBackend(BaseBackend):
                 f"不支援的 DBF 編碼：{enc}（可用：utf-8、big5/cp950、gbk）"
             )
         self.codepage = codepage
+        self._scan_key = None
+        self._scan_stat = None
+        self._scan_matches = None
+
+    @property
+    def slow_warning(self):
+        try:
+            size = os.path.getsize(self.path)
+        except OSError:
+            return None
+        if size > self._CACHE_SIZE_LIMIT:
+            return (
+                f"大型 DBF 檔（{size / 1024 / 1024:.0f} MB）：搜尋需全表掃描，"
+                "首次查詢可能較慢，結果會自動快取供翻頁使用"
+            )
+        return None
+
+    def _file_stat(self):
+        try:
+            st = os.stat(self.path)
+            return (st.st_size, st.st_mtime_ns)
+        except OSError:
+            return None
 
     def table_name(self):
         return os.path.splitext(os.path.basename(self.path))[0]
@@ -467,31 +635,49 @@ class DbfFileBackend(BaseBackend):
             raise DatabaseError("DBF 檔沒有任何欄位")
         return cols
 
-    def search(self, criteria, page, page_size):
+    def search(self, criteria, page, page_size, after=None, before=None):
         mapping = self.resolve_mapping()
         wanted = {
             field: str(criteria[field]).strip().lower()
             for field in FIELD_ORDER
             if criteria.get(field) and field in mapping
         }
-        rows = []
-        total = 0
+        key = tuple(sorted(wanted.items()))
+        stat = self._file_stat()
+        if self._scan_key != key or self._scan_stat != stat:
+            matches = self._scan_all(mapping, wanted)
+            self._scan_key, self._scan_stat, self._scan_matches = key, stat, matches
+        matches = self._scan_matches
+        total = len(matches)
         offset = (page - 1) * page_size
+        page_rows = matches[offset:offset + page_size]
+        rows = [
+            {mapping[f]: row.get(mapping[f]) for f in FIELD_ORDER if f in mapping}
+            for row in page_rows
+        ]
+        return rows, total
+
+    def _scan_all(self, mapping, wanted):
+        """單次全表掃描，回傳符合條件的列（含全部欄位值）。"""
+        matches = []
         table = self._open()
         try:
-            names = [c for c in table.field_names]
+            names = list(table.field_names)
             for record in table:
                 row = {name: self._cell(record[name]) for name in names}
                 if all(
                     wanted[f] in str(row.get(mapping[f], "")).lower()
                     for f in wanted
                 ):
-                    total += 1
-                    if offset <= (total - 1) < offset + page_size:
-                        rows.append({mapping[f]: row.get(mapping[f]) for f in FIELD_ORDER if f in mapping})
+                    matches.append(row)
         finally:
             table.close()
-        return rows, total
+        return matches
+
+    def _invalidate_scan(self):
+        self._scan_key = None
+        self._scan_stat = None
+        self._scan_matches = None
 
     def insert(self, values):
         pairs = self._field_pairs()
@@ -499,13 +685,14 @@ class DbfFileBackend(BaseBackend):
         table = self._open(write=True)
         try:
             table.append(data)
+            self._invalidate_scan()
             return 1
         except Exception as exc:
             raise DatabaseError(f"寫入 DBF 失敗（欄位長度或型別不符？）：{exc}") from exc
         finally:
             table.close()
 
-    def delete(self, criteria):
+    def delete(self, criteria, pk=None):
         import dbf as dbflib
 
         pairs = self._field_pairs()
@@ -524,13 +711,15 @@ class DbfFileBackend(BaseBackend):
         table = self._open(write=True)
         removed = 0
         try:
-            for record in list(table):
+            # 直接迭代標記刪除，避免 list() 將整表載入記憶體
+            for record in table:
                 current = {col: self._cell(record[col]) for col in wanted}
                 if all(current[col] == val for col, val in wanted.items()):
                     dbflib.delete(record)
                     removed += 1
             if removed:
                 table.pack()
+            self._invalidate_scan()
             return removed
         except Exception as exc:
             raise DatabaseError(f"刪除 DBF 記錄失敗：{exc}") from exc
@@ -608,7 +797,20 @@ class AccessFileBackend(BaseBackend):
     def _fetch_columns(self):
         return list(self._load_rows()[0].keys()) if self._load_rows() else []
 
-    def search(self, criteria, page, page_size):
+    @property
+    def slow_warning(self):
+        try:
+            count = len(self._load_rows())
+        except DatabaseError:
+            return None
+        if count > 100_000:
+            return (
+                f"資料表約 {count:,} 列：Access 格式需於記憶體中全表比對，"
+                "搜尋可能較慢，建議先轉檔為 SQLite"
+            )
+        return None
+
+    def search(self, criteria, page, page_size, after=None, before=None):
         mapping = self.resolve_mapping()
         wanted = {
             field: str(criteria[field]).strip().lower()
@@ -633,7 +835,7 @@ class AccessFileBackend(BaseBackend):
     def insert(self, values):
         raise DatabaseError("Microsoft Access 格式為唯讀，不支援寫入")
 
-    def delete(self, criteria):
+    def delete(self, criteria, pk=None):
         raise DatabaseError("Microsoft Access 格式為唯讀，不支援寫入")
 
 

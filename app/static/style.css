@@ -106,6 +106,7 @@ input:focus { outline: 2px solid var(--primary); outline-offset: 0; border-color
 }
 .alert-error { background: var(--danger-bg); color: var(--danger); border-color: #f2c4c1; }
 .alert-info { background: var(--info-bg); color: var(--info-text); border-color: #c4dbef; }
+.alert-warning { background: #fff4d6; color: #8a6d1a; border-color: #f0dc9e; }
 
 .result-meta { margin: 4px 0 10px; color: var(--muted); }
 

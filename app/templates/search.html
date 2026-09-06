@@ -4,6 +4,7 @@
 <h1>會員資料條件查詢</h1>
 
 {% if description %}<div class="alert alert-info">已載入：{{ description }}</div>{% endif %}
+{% if slow_warning %}<div class="alert alert-warning">{{ slow_warning }}</div>{% endif %}
 
 <form method="get" action="{{ url_for('search.index') }}" class="card search-form">
   <div class="grid">
@@ -64,6 +65,9 @@
         <form method="post" action="{{ url_for('search.delete_row') }}" class="inline"
               onsubmit="return confirm('確定刪除這一筆資料？');">
           <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+          {% for pk in pk_fields %}
+          <input type="hidden" name="pk.{{ pk }}" value="{{ row[pk] if row[pk] is not none else '' }}">
+          {% endfor %}
           {% for field in visible_fields %}
           <input type="hidden" name="{{ field }}" value="{{ row[mapping[field]] if row[mapping[field]] is not none else '' }}">
           {% endfor %}
@@ -82,12 +86,18 @@
 {% set start = [1, page - 4]|max %}
 {% set end = [pages, page + 4]|min %}
 <nav class="pager">
+  {% if prev_key %}
+  <a href="{{ url_for('search.index', page=page-1, before=prev_key, **criteria) }}">← 上一頁</a>
+  {% endif %}
   {% if start > 1 %}<a href="{{ url_for('search.index', page=1, **criteria) }}">1…</a>{% endif %}
   {% for p in range(start, end + 1) %}
     {% if p == page %}<span class="cur">{{ p }}</span>
     {% else %}<a href="{{ url_for('search.index', page=p, **criteria) }}">{{ p }}</a>{% endif %}
   {% endfor %}
   {% if end < pages %}<a href="{{ url_for('search.index', page=pages, **criteria) }}">…{{ pages }}</a>{% endif %}
+  {% if next_key and page < pages %}
+  <a href="{{ url_for('search.index', page=page+1, after=next_key, **criteria) }}">下一頁 →</a>
+  {% endif %}
 </nav>
 {% endif %}
 {% elif not error %}

@@ -43,6 +43,80 @@ class SqliteWriteTests(unittest.TestCase):
         self.assertEqual(remaining, 0)
 
 
+class SqlitePkTests(unittest.TestCase):
+    """主鍵精準刪除：兩筆完全相同資料也能只刪目標列。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="wpk-")
+        self.path = os.path.join(self.tmp, "pk.db")
+        import sqlite3
+
+        with sqlite3.connect(self.path) as conn:
+            conn.execute(
+                'CREATE TABLE Members ('
+                ' "身分證字號" TEXT PRIMARY KEY,'
+                ' "姓名" TEXT, "戶籍地址" TEXT, "聯絡電話" TEXT)'
+            )
+            for i in range(3):
+                conn.execute(
+                    'INSERT INTO Members VALUES (?,?,?,?)',
+                    (f"A00000000{i}", "同名同址", "相同地址", "0900-000-000"),
+                )
+        self.backend = SqliteBackend({"path": self.path, "table": "Members"})
+
+    def test_pk_columns_detected(self):
+        self.assertEqual(self.backend.pk_columns(), ["身分證字號"])
+
+    def test_search_returns_pk_in_rows(self):
+        rows, total = self.backend.search({"name": "同名同址"}, 1, 10)
+        self.assertEqual(total, 3)
+        self.assertEqual(
+            [r["身分證字號"] for r in rows],
+            ["A000000000", "A000000001", "A000000002"],
+        )
+
+    def test_delete_by_pk_removes_only_target_row(self):
+        removed = self.backend.delete({}, pk={"身分證字號": "A000000001"})
+        self.assertEqual(removed, 1)
+        rows, total = self.backend.search({"name": "同名同址"}, 1, 10)
+        self.assertEqual(total, 2)
+        self.assertEqual(
+            [r["身分證字號"] for r in rows], ["A000000000", "A000000002"]
+        )
+
+    def test_delete_falls_back_to_criteria_without_pk(self):
+        removed = self.backend.delete({"name": "同名同址"})
+        self.assertEqual(removed, 3)
+
+    def test_keyset_next_page(self):
+        rows, total = self.backend.search({"name": "同名同址"}, 1, 2)
+        self.assertEqual(len(rows), 2)
+        rows2, total2 = self.backend.search(
+            {"name": "同名同址"}, 2, 2, after=rows[-1]["身分證字號"]
+        )
+        self.assertEqual(total2, 3)
+        self.assertEqual([r["身分證字號"] for r in rows2], ["A000000002"])
+
+    def test_keyset_previous_page(self):
+        rows, _ = self.backend.search({"name": "同名同址"}, 1, 2)
+        self.assertEqual(
+            [r["身分證字號"] for r in rows], ["A000000000", "A000000001"]
+        )
+        next_rows, _ = self.backend.search(
+            {"name": "同名同址"}, 2, 2, after=rows[-1]["身分證字號"]
+        )
+        self.assertEqual(
+            [r["身分證字號"] for r in next_rows], ["A000000002"]
+        )
+        prev_rows, _ = self.backend.search(
+            {"name": "同名同址"}, 1, 2, before=next_rows[0]["身分證字號"]
+        )
+        self.assertEqual(
+            [r["身分證字號"] for r in prev_rows],
+            ["A000000000", "A000000001"],
+        )
+
+
 class DbfBackendTests(unittest.TestCase):
     def _make_dbf(self, path):
         import dbf
@@ -119,12 +193,14 @@ class AutoModeRoutingTests(unittest.TestCase):
 
     def test_mdf_in_auto_mode_guides_user(self):
         path = os.path.join(self.tmp, "x.mdf")
-        page = bytearray(8192)
+        data = bytearray(8192 * 4)
+        for i, t in enumerate((15, 11, 8, 9)):  # 檔案標頭 / PFS / GAM / SGAM
+            data[i * 8192] = 1
+            data[i * 8192 + 1] = t
         marker = b"Microsoft SQL Server"
-        page[100:100 + len(marker)] = marker
+        data[100:100 + len(marker)] = marker
         with open(path, "wb") as fh:
-            fh.write(page)
-            fh.write(bytearray(8192))
+            fh.write(data)
         with self.assertRaises(DatabaseError) as ctx:
             create_backend({"backend": "auto", "file": path})
         self.assertIn("sqlserver", str(ctx.exception))

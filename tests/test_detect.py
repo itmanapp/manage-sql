@@ -32,12 +32,29 @@ def make_dbf(path):
 
 
 def make_mdf(path):
-    page = bytearray(8192)
+    """建立具真實 SQL Server 頁面型別結構的假 MDF（4 個 8KB 頁）。"""
+    pages = []
+    page0 = bytearray(8192)
+    page0[0] = 1
+    page0[1] = 15  # 第 0 頁：檔案標頭（FILE_HEADER）
     marker = b"AdventureWorksLT2012\x00Microsoft SQL Server"
-    page[100:100 + len(marker)] = marker
+    page0[100:100 + len(marker)] = marker
+    pages.append(page0)
+    page1 = bytearray(8192)
+    page1[0] = 1
+    page1[1] = 11  # PFS
+    pages.append(page1)
+    page2 = bytearray(8192)
+    page2[0] = 1
+    page2[1] = 8  # GAM
+    pages.append(page2)
+    page3 = bytearray(8192)
+    page3[0] = 1
+    page3[1] = 9  # SGAM
+    pages.append(page3)
     with open(path, "wb") as fh:
-        fh.write(page)
-        fh.write(bytearray(8192))
+        for page in pages:
+            fh.write(page)
     return path
 
 
@@ -82,6 +99,28 @@ class DetectTests(unittest.TestCase):
         make_mdf(p)
         det = detect_database(p)
         self.assertEqual(det.file_type, "mdf")
+
+    def test_aligned_mdf_extension_without_structure_rejected(self):
+        # 僅 8KB 對齊 + .mdf 副檔名但沒有頁面型別結構／特徵字串 → 應拒絕
+        p = self._path("fake-aligned.mdf")
+        data = bytearray(8192 * 4)
+        for i in range(4):
+            data[i * 8192 + 13] = 90  # 無效頁面型別
+        with open(p, "wb") as fh:
+            fh.write(data)
+        with self.assertRaises(ValueError):
+            detect_database(p)
+
+    def test_random_aligned_noext_not_mdf(self):
+        # 無副檔名、8KB 對齊但無頁面型別 → 不應誤判為 MDF
+        p = self._path("random-aligned")
+        data = bytearray(8192 * 4)
+        for i in range(4):
+            data[i * 8192 + 13] = 90
+        with open(p, "wb") as fh:
+            fh.write(data)
+        with self.assertRaises(ValueError):
+            detect_database(p)
 
     def test_unknown_file_rejected(self):
         p = self._path("junk.bin")

@@ -38,20 +38,48 @@ def _looks_like_dbf(header):
     return 33 <= header_length <= 65535 and 1 <= record_length <= 65535
 
 
+MDF_PAGE_SIZE = 8192
+# 每個 8KB 頁標頭：位元組 0 為標頭版本（=1），位元組 1 為頁面型別
+# （經真實 AdventureWorks MDF 驗證：頁0=15 檔案標頭、頁1=11 PFS、
+#  頁2=8 GAM、頁3=9 SGAM）
+MDF_PAGE_TYPE_OFFSET = 1
+MDF_PAGE_TYPE_FILE_HEADER = 15  # 第 0 頁（檔案標頭）
+MDF_MANAGEMENT_TYPES = {8, 9, 11, 13}  # GAM / SGAM / PFS / Boot
+
+
 def _looks_like_mdf(path, header):
     try:
         size = os.path.getsize(path)
     except OSError:
         return False
-    aligned = size > 0 and size % 8192 == 0
+    aligned = size > 0 and size % MDF_PAGE_SIZE == 0
     ext_match = str(path).lower().endswith(".mdf")
     if not aligned:
         return False
+    # 主要判別：檢查前幾個 8KB 頁的頁面型別。
+    # 真實 MDF：第 0 頁為檔案標頭（型別 15），第 1~3 頁為
+    # PFS(11)/GAM(8)/SGAM(9) 等管理頁，是資料檔獨有的結構特徵。
+    if size >= MDF_PAGE_SIZE * 4:
+        with open(path, "rb") as fh:
+            first = fh.read(MDF_PAGE_SIZE * 4)
+        types = [
+            first[i * MDF_PAGE_SIZE + MDF_PAGE_TYPE_OFFSET]
+            for i in range(4)
+            if len(first) >= (i + 1) * MDF_PAGE_SIZE
+        ]
+        if len(types) == 4:
+            if (
+                types[0] == MDF_PAGE_TYPE_FILE_HEADER
+                and any(t in MDF_MANAGEMENT_TYPES for t in types[1:])
+            ):
+                return True
+    # 頁面型別不符（例如檔案過小）時，僅對 .mdf 副檔名且內含
+    # SQL Server 特徵字串的檔案放行，避免假檔誤判。
     if ext_match:
-        return True
-    with open(path, "rb") as fh:
-        chunk = fh.read(1024 * 1024)
-    return b"Microsoft" in chunk
+        with open(path, "rb") as fh:
+            chunk = fh.read(1024 * 1024)
+        return b"Microsoft SQL Server" in chunk or b"SQL Server" in chunk
+    return False
 
 
 def detect_database(path):

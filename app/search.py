@@ -21,6 +21,7 @@ def _base_context():
         "labels": FIELD_LABELS,
         "mapping": {},
         "visible_fields": [],
+        "pk_fields": [],
         "criteria": {},
         "rows": [],
         "total": None,
@@ -29,6 +30,9 @@ def _base_context():
         "page_size": 20,
         "error": None,
         "warning": None,
+        "slow_warning": None,
+        "prev_key": None,
+        "next_key": None,
         "can_write": False,
         "description": "",
     }
@@ -53,6 +57,7 @@ def index():
         context["description"] = backend.describe()
     except Exception:
         context["description"] = ""
+    context["slow_warning"] = getattr(backend, "slow_warning", None)
 
     try:
         mapping = backend.resolve_mapping()
@@ -62,6 +67,10 @@ def index():
     context["mapping"] = mapping
     context["visible_fields"] = [f for f in FIELD_ORDER if f in mapping]
     context["warning"] = getattr(backend, "mapping_warning", None)
+    try:
+        context["pk_fields"] = backend.pk_columns()
+    except DatabaseError:
+        context["pk_fields"] = []
 
     criteria = {}
     for field in FIELD_ORDER:
@@ -80,14 +89,22 @@ def index():
         except ValueError:
             page = 1
         context["page"] = page
+        after = request.args.get("after")
+        before = request.args.get("before")
         try:
-            rows, total = backend.search(criteria, page, page_size)
+            rows, total = backend.search(
+                criteria, page, page_size, after=after, before=before
+            )
         except DatabaseError as exc:
             context["error"] = f"資料庫查詢失敗：{exc}"
             return render_template("search.html", **context)
         context["rows"] = rows
         context["total"] = total
         context["pages"] = max((total + page_size - 1) // page_size, 1)
+        if rows and getattr(backend, "keyset", False):
+            order_col = mapping.get("idcard") or next(iter(mapping.values()))
+            context["prev_key"] = rows[0].get(order_col)
+            context["next_key"] = rows[-1].get(order_col)
 
     return render_template("search.html", **context)
 
@@ -124,8 +141,13 @@ def delete_row():
         for field in FIELD_ORDER
         if field in request.form
     }
+    pk = {
+        key[len("pk."):]: request.form.get(key)
+        for key in request.form
+        if key.startswith("pk.")
+    }
     try:
-        removed = backend.delete(criteria)
+        removed = backend.delete(criteria, pk=pk or None)
         if removed:
             flash(f"已刪除 {removed} 筆資料", "info")
         else:

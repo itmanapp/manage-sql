@@ -93,19 +93,27 @@ def cmd_detect(args):
     if det.file_type == "sqlite":
         import sqlite3
 
-        with sqlite3.connect(args.file) as conn:
-            rows = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-                " AND name NOT LIKE 'sqlite_%' ORDER BY name"
-            ).fetchall()
-        names = [r[0] for r in rows]
+        try:
+            with sqlite3.connect(args.file) as conn:
+                rows = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                    " AND name NOT LIKE 'sqlite_%' ORDER BY name"
+                ).fetchall()
+            names = [r[0] for r in rows]
+        except sqlite3.Error as exc:
+            sys.exit(f"讀取 SQLite 資料表清單失敗：{exc}")
         print(f"資料表：{', '.join(names) if names else '(無)'}")
         print("設定方式：database.backend: auto + database.file 指向此檔，並填 database.table")
     elif det.file_type in ("mdb", "accdb"):
         from access_parser import AccessParser
 
-        parser = AccessParser(args.file)
-        tables = sorted(parser.catalog.keys())
+        try:
+            parser = AccessParser(args.file)
+            tables = sorted(parser.catalog.keys())
+        except Exception as exc:
+            sys.exit(
+                f"檔案判別為 {det.label}，但內容解析失敗（檔案可能損毀或不完整）：{exc}"
+            )
         print(f"資料表：{', '.join(tables) if tables else '(無)'}")
         print("設定方式：database.backend: auto + database.file 指向此檔，並填 database.table")
     elif det.file_type == "dbf":
