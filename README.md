@@ -11,19 +11,23 @@ CI 已使用 **Microsoft 官方 AdventureWorksLT2012 範例 MDF** 在真實 SQL 
 | 需求 | 實作 |
 |---|---|
 | 讀取 MSSQL 資料庫（MDF 檔） | 透過 `pymssql` 連線 SQL Server；MDF 以 `FOR ATTACH` 方式載入（見下方） |
-| 多格式資料庫檔案 + 自動判別 | `backend: auto` 自動辨識 SQLite／Access(MDB/ACCDB)／dBASE(DBF)／SQL Server MDF |
+| 多格式資料庫檔案 + 自動判別 | `backend: auto` 自動辨識 SQLite／Access(MDB/ACCDB)／dBASE(DBF)／SQL Server MDF；MDF 以**頁面型別結構**（檔案標頭 + PFS/GAM/SGAM 管理頁）做內容驗證，避免假檔誤判 |
 | 條件搜尋：姓名／身份證／地址／電話 | 參數化 LIKE 查詢，多條件 AND 結合，支援部分比對、分頁 |
-| 資料寫入 | 可讀寫格式提供網頁「新增一筆」與逐列「刪除」（含確認），唯讀格式自動隱藏 |
+| 資料寫入 | 可讀寫格式提供網頁「新增一筆」與逐列「刪除」（含確認）；資料表具主鍵時以**主鍵精準刪除**，無主鍵才退回全欄位比對；唯讀格式自動隱藏 |
+| 分頁效能 | 頁面分頁器提供「上一頁／下一頁」**keyset 分頁**（以排序欄位值定位，深頁不需重掃 OFFSET）；數字頁籤仍可用 |
+| DBF 大檔效能 | 搜尋結果依「條件 + 檔案修改時間」自動快取，翻頁不重掃；大於 15MB 的 DBF 與超過 10 萬列的 Access 會在頁面提示 |
 | 離線登入認證 + TOTP | 本地 SQLite 帳號庫（PBKDF2-HMAC-SHA256），TOTP 依 RFC 6238 自行實作，零外部服務 |
 
 其他安全設計：
 
 - 兩步式登入：密碼正確後才進入 TOTP 頁
 - TOTP 重放防護：同一時間切片（30 秒）的代碼只能使用一次
+- **TOTP 連續錯誤防護**：動態碼連續錯 5 次鎖定 5 分鐘，避免暴力嘗試
 - 密碼連續錯誤 5 次 → 鎖定 5 分鐘
-- 所有表單附 CSRF token；Session Cookie 設 `HttpOnly` / `SameSite=Lax`
+- 所有表單附 CSRF token；Session Cookie 設 `HttpOnly` / `SameSite=Lax`，可選 `Secure`
 - SQL 一律參數化，識別碼加引號處理，輸入長度限制
 - 未偵測使用者時也執行雜湊運算，避免帳號枚舉時序攻擊
+- 帳號庫 `instance/users.db` 自動限制為本機 0600 權限
 
 ## 目錄結構
 
@@ -105,7 +109,8 @@ database:
   # 會印出類型、可否寫入、可用資料表清單與建議設定方式
   ```
 - DBF 中文亂碼時調整 `encoding`（台灣常用 `big5`）；DBF 為固定長度欄位，寫入超出欄位寬度會被拒絕並提示
-- Access 格式基於第三方解析器（access-parser）為唯讀；需要寫入時請先轉換為 SQLite
+- DBF 查詢需全表掃描：結果依「查詢條件 + 檔案修改時間」快取，同條件翻頁不重掃；單檔超過 15MB 時頁面會提示（資料量很大建議先轉換為 SQLite）
+- Access 格式基於第三方解析器（access-parser）為唯讀，全表於記憶體中比對（超過 10 萬列會提示）；需要寫入時請先轉換為 SQLite
 - 選到 `.mdf` 時會引導改用 `backend: sqlserver`（需先附加至引擎）
 
 ## 正式環境：載入 MDF 檔
@@ -238,6 +243,7 @@ qrencode -o alice-totp.png "otpauth://totp/MdfQuery:alice?secret=..."   # 存成
 |---|---|
 | 「動態驗證碼錯誤」，確定輸入正確 | 手機時鐘不準。開啟自動日期時間；Google Authenticator：設定 →「時間校正」（同步時間） |
 | 提示「已被使用」 | 同一組代碼只能用一次，等 App 跳出下一組再輸入 |
+| 提示「已暫時鎖定」 | 動態碼連續錯 5 次會鎖 5 分鐘後自動解鎖；急件可由管理員 `reset-totp` 重置失敗計數 |
 | 換手機 / App 刪除 / 遺失 | 管理員執行 `.venv/bin/python manage.py reset-totp alice`，取得**新密鑰**重新走一次第 2～4 步；舊密鑰立即失效 |
 | 忘記密碼 | 管理員先 `reset-totp`（順便解鎖），再刪除重建該帳號（目前版本未提供改密指令，可於 `adduser` 同名覆蓋前先確認設計） |
 | 帳號被鎖定 | 連續錯 5 次密碼會鎖 5 分鐘後自動解鎖；急件可由管理員 `reset-totp` 重置失敗計數 |
@@ -264,10 +270,14 @@ qrencode -o alice-totp.png "otpauth://totp/MdfQuery:alice?secret=..."   # 存成
 ### 本機測試
 
 ```bash
-.venv/bin/python -m unittest discover -s tests -p "test_*.py"   # 單元 + E2E + 多格式測試（37 例）
+.venv/bin/python -m unittest discover -s tests -p "test_*.py"   # 單元 + E2E + 多格式 + 帳號庫測試（51 例）
 ./scripts/smoke_test.sh                                          # 本機 HTTP 全流程煙霧測試（SQLite 示範模式）
 .venv/bin/python manage.py detect <檔案>                          # 判別任意資料庫檔案類型
 ```
+
+> 測試涵蓋：TOTP RFC 4226/6238 向量、五種格式判別（含 MDF 頁面型別與假檔拒絕）、
+> SQLite／DBF 讀寫與主鍵精準刪除、keyset 前一頁／下一頁、TOTP 連續錯誤鎖定、
+> 帳號庫舊版 schema 自動遷移與檔案權限、登入 E2E 全流程。
 
 ### CI：真實 SQL Server + 官方 MDF 整合測試
 
@@ -281,6 +291,12 @@ GitHub Actions 工作流程（`.github/workflows/ci.yml`）每次推送自動執
 
 ## 上線前建議
 
-- 以反向代理（nginx/Caddy）加上 HTTPS，並將 `SESSION_COOKIE_SECURE = True` 加入 `app/__init__.py`
+- 以反向代理（nginx/Caddy）加上 HTTPS，並於 `config.yaml` 設 `server.secure_cookie: true` 讓 Session Cookie 帶上 `Secure` 旗標
+- SQL Server 資料量大時，請為排序欄位（預設為身份證對應欄）建立索引，例如：
+  ```sql
+  CREATE INDEX IX_Members_IdCard ON dbo.Members (IdCard);
+  ```
+  分頁器「上一頁／下一頁」使用 keyset 定位，深頁瀏覽不需重掃 OFFSET；排序欄位值重複時可能略過同值列，建議排序欄位接近唯一
 - 更換 Docker `SA_PASSWORD`，勿使用範例值
 - 定期備份 `instance/users.db`（遺失等同重建所有帳號）
+- 設定環境變數 `MANAGE_SQL_CONFIG` 可指定替代設定檔路徑（舊名稱 `MDFEDIT_CONFIG` 仍相容）
