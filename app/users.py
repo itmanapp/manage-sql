@@ -1,4 +1,5 @@
 import hashlib
+import os
 import secrets
 import sqlite3
 import time
@@ -7,6 +8,8 @@ PBKDF2_ITERATIONS = 310000
 SALT_BYTES = 16
 MAX_FAILURES = 5
 LOCK_SECONDS = 300
+MAX_TOTP_FAILURES = 5
+TOTP_LOCK_SECONDS = 300
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -19,6 +22,12 @@ CREATE TABLE IF NOT EXISTS users (
     created_at REAL NOT NULL
 )
 """
+
+# 舊版資料庫缺少的欄位（自動遷移）
+_EXTRA_COLUMNS = (
+    ("totp_failures", "INTEGER NOT NULL DEFAULT 0"),
+    ("totp_locked_until", "REAL NOT NULL DEFAULT 0"),
+)
 
 
 def hash_password(password, salt_hex=None):
@@ -49,6 +58,15 @@ class UserStore:
     def ensure(self):
         with self._conn() as conn:
             conn.execute(_SCHEMA)
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)")}
+            for name, decl in _EXTRA_COLUMNS:
+                if name not in cols:
+                    conn.execute(f"ALTER TABLE users ADD COLUMN {name} {decl}")
+        try:
+            # 帳號庫含密碼雜湊與 TOTP 密鑰，限制本機其他使用者讀取
+            os.chmod(self.path, 0o600)
+        except OSError:
+            pass
 
     def get(self, username):
         with self._conn() as conn:
@@ -105,6 +123,33 @@ class UserStore:
             conn.execute(
                 "UPDATE users SET totp_last_step = ? WHERE username = ?",
                 (step, username),
+            )
+
+    def record_totp_failure(self, username):
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT totp_failures FROM users WHERE username = ?", (username,)
+            ).fetchone()
+            if not row:
+                return
+            attempts = row["totp_failures"] + 1
+            locked_until = (
+                time.time() + TOTP_LOCK_SECONDS
+                if attempts >= MAX_TOTP_FAILURES
+                else 0
+            )
+            conn.execute(
+                "UPDATE users SET totp_failures = ?, totp_locked_until = ?"
+                " WHERE username = ?",
+                (attempts, locked_until, username),
+            )
+
+    def reset_totp_failures(self, username):
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE users SET totp_failures = 0, totp_locked_until = 0"
+                " WHERE username = ?",
+                (username,),
             )
 
     def list_users(self):

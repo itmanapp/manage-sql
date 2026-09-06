@@ -80,6 +80,22 @@ class EndToEndTests(unittest.TestCase):
         body = resp.get_data(as_text=True)
         self.assertIn("動態驗證碼錯誤或已被使用", body)
 
+    def test_totp_locked_after_repeated_failures(self):
+        token = self._login()
+        for i in range(4):
+            resp = self.client.post(
+                "/login/totp",
+                data={"code": "000000", "_csrf": token},
+            )
+            self.assertIn("動態驗證碼錯誤或已被使用", resp.get_data(as_text=True))
+        # 第 5 次失敗即鎖定
+        resp = self.client.post(
+            "/login/totp",
+            data={"code": "000000", "_csrf": token},
+        )
+        body = resp.get_data(as_text=True)
+        self.assertIn("已暫時鎖定", body)
+
     def test_full_login_and_search_by_name(self):
         token = self._login()
         resp = self.client.post(

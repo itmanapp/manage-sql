@@ -14,7 +14,12 @@ from flask import (
 
 from . import totp
 from .security import check_csrf, csrf_token
-from .users import MAX_FAILURES, hash_password, verify_password
+from .users import (
+    MAX_FAILURES,
+    MAX_TOTP_FAILURES,
+    hash_password,
+    verify_password,
+)
 
 bp = Blueprint("auth", __name__)
 
@@ -26,6 +31,23 @@ def _dummy_hash():
     if _dummy_hash_cache is None:
         _dummy_hash_cache = hash_password("timing-equalizer")
     return _dummy_hash_cache
+
+
+def _totp_lock_message(user):
+    """TOTP 連續錯誤鎖定期間回傳提示文字，否則 None。"""
+    locked_until = user.get("totp_locked_until") or 0
+    if locked_until > time.time():
+        minutes = int(locked_until - time.time()) // 60 + 1
+        return (
+            f"動態驗證碼連續錯誤 {MAX_TOTP_FAILURES} 次，"
+            f"已暫時鎖定，請約 {minutes} 分鐘後再試"
+        )
+    if (user.get("totp_failures") or 0) > 0:
+        left = MAX_TOTP_FAILURES - user["totp_failures"]
+        if left <= 0:
+            return None
+        return f"（剩餘 {left} 次嘗試機會）"
+    return None
 
 
 @bp.app_context_processor
@@ -75,14 +97,27 @@ def totp_step():
     if user is None:
         session.pop("pending_user", None)
         return redirect(url_for("auth.login"))
+    lock_msg = _totp_lock_message(user)
+    if lock_msg and (user.get("totp_locked_until") or 0) > time.time():
+        flash(lock_msg, "error")
+        return render_template("totp.html", username=username)
     if request.method == "POST":
         if not check_csrf():
             abort(400)
         code = request.form.get("code", "").strip().replace(" ", "")
         step = totp.verify(user["totp_secret"], code, user["totp_last_step"])
         if step is False:
-            flash("動態驗證碼錯誤或已被使用，請重新輸入", "error")
+            users.record_totp_failure(username)
+            fresh = users.get(username)
+            if (fresh.get("totp_locked_until") or 0) > time.time():
+                flash(_totp_lock_message(fresh), "error")
+            else:
+                hint = _totp_lock_message(fresh)
+                flash(
+                    f"動態驗證碼錯誤或已被使用{hint or ''}", "error"
+                )
         else:
+            users.reset_totp_failures(username)
             users.mark_totp_used(username, step)
             identity = username
             session.clear()
