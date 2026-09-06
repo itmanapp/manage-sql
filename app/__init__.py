@@ -33,7 +33,8 @@ def create_app(
     app = Flask(__name__, instance_path=instance_path)
     resolved_path = (
         config_path
-        or os.environ.get("MDFEDIT_CONFIG")
+        or os.environ.get("MANAGE_SQL_CONFIG")
+        or os.environ.get("MDFEDIT_CONFIG")  # 舊版環境變數，向後相容
         or os.path.join(app.root_path, "..", "config.yaml")
     )
     cfg = load_config(resolved_path)
@@ -43,6 +44,9 @@ def create_app(
     app.config.update(
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
+        SESSION_COOKIE_SECURE=bool(
+            cfg.get("server", {}).get("secure_cookie", False)
+        ),
         PERMANENT_SESSION_LIFETIME=1800,
         MAX_CONTENT_LENGTH=64 * 1024,
     )

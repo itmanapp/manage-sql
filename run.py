@@ -2,7 +2,9 @@ import os
 
 from app import create_app
 
-app = create_app(os.environ.get("MDFEDIT_CONFIG"))
+app = create_app(
+    os.environ.get("MANAGE_SQL_CONFIG") or os.environ.get("MDFEDIT_CONFIG")
+)
 
 if __name__ == "__main__":
     server = app.config["APP_CFG"].get("server", {})

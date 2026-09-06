@@ -1,6 +1,8 @@
 server:
   host: 127.0.0.1
   port: 8000
+  # 若以 HTTPS 提供服務請設 true（Session Cookie 加上 Secure 旗標）
+  secure_cookie: false
 
 database:
   backend: sqlite
