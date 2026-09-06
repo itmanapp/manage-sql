@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/itmanapp/manage-sql/actions/workflows/ci.yml/badge.svg)](https://github.com/itmanapp/manage-sql/actions/workflows/ci.yml)
 
-離線環境專用的會員資料查詢網頁。讀取 Microsoft SQL Server 資料庫（`.mdf` 檔附加後的資料表），支援「姓名、身份證、地址、電話」四條件搜尋，並以**帳號密碼 + TOTP 動態驗證碼**進行完全離線的兩階段登入認證。
+離線環境專用的資料庫查詢網頁。可直接讀取 **SQLite／Access(MDB/ACCDB)／dBASE(DBF)** 資料檔（自動判別），亦可連線 **Microsoft SQL Server** 讀取 `.mdf` 檔附加後的資料表；支援「姓名、身份證、地址、電話」四條件搜尋，並以**帳號密碼 + TOTP 動態驗證碼**進行完全離線的兩階段登入認證。
 
 CI 已使用 **Microsoft 官方 AdventureWorksLT2012 範例 MDF** 在真實 SQL Server 2022 容器上驗證完整流程（附加 MDF → 登入 → TOTP → 四欄位搜尋）。
 
@@ -33,21 +33,26 @@ CI 已使用 **Microsoft 官方 AdventureWorksLT2012 範例 MDF** 在真實 SQL 
 
 ```
 ├── run.py                  啟動伺服器
-├── manage.py               管理工具（建帳號、重設 TOTP、示範資料）
+├── manage.py               管理工具（建帳號、重設 TOTP、示範資料、檔案判別）
 ├── config.yaml             主要設定（自 config.yaml.example 複製）
 ├── app/
+│   ├── __init__.py         應用工廠（設定、密鑰、Cookie 安全旗標）
 │   ├── auth.py             登入／TOTP／登出流程
 │   ├── search.py           搜尋頁邏輯
-│   ├── db.py               SQL Server / SQLite 後端、欄位自動對應
+│   ├── db.py               多格式後端（SQL Server / SQLite / DBF / Access）、欄位自動對應
+│   ├── dbdetect.py         檔案類型判別（魔術位元組、頁面型別結構）
+│   ├── config.py           設定載入與預設值合併
+│   ├── security.py         CSRF token、登入保護裝飾器
 │   ├── totp.py             RFC 6238 TOTP 實作
-│   ├── users.py            帳號儲存（SQLite + PBKDF2）
+│   ├── users.py            帳號儲存（SQLite + PBKDF2、失敗鎖定）
 │   └── templates/, static/
 ├── scripts/
 │   ├── attach_mdf.sh       將 MDF/LDF 附加進 Docker 版 SQL Server
+│   ├── seed_members.sql    CI：由 AdventureWorks 資料建立可搜尋的 Members 表
 │   └── smoke_test.sh       端對端煙霧測試
 ├── docker-compose.yml      離線可用的 SQL Server 2022 容器
 ├── .github/workflows/ci.yml  CI：真實 SQL Server 附加 MDF 的整合測試
-└── tests/                  單元測試、E2E、多格式讀寫、MSSQL 整合測試
+└── tests/                  單元測試、E2E、多格式讀寫、帳號庫、MSSQL 整合測試
 ```
 
 ## 安裝
@@ -141,7 +146,7 @@ cp config.yaml.example config.yaml
 
 ### 4. 安裝完成驗收標準（全部通過才算完成）
 
-- [ ] `python3 -m unittest discover -s tests -p "test_*.py"` → **51 例全數 OK**
+- [ ] `python3 -m unittest discover -s tests -p "test_*.py"` → **52 例全數 OK**
 - [ ] `curl` 登入頁回 **200**（伺服器已啟動）
 - [ ] `./scripts/smoke_test.sh`（需 venv 環境）→ 最後輸出 `SMOKE TEST DONE`
 - [ ] 以「密碼 + 當下動態碼」登入成功後，搜尋 `王小美` 可找到示範資料（身份證 `A289635741`）
@@ -175,7 +180,7 @@ cp config.yaml.example config.yaml
 | dBASE / FoxPro | `.dbf` | 版本旗標＋日期＋標頭長度結構 | ✅ | ✅ 新增／刪除 |
 | Microsoft Access (Jet) | `.mdb` | 偏移 4 的 `Standard Jet DB` | ✅ | ❌ 唯讀 |
 | Microsoft Access (ACE) | `.accdb` | 偏移 4 的 `Standard ACE DB` | ✅ | ❌ 唯讀 |
-| SQL Server 資料檔 | `.mdf` | 8KB 分頁對齊＋內容特徵 | 需先附加引擎 | 經 SQL Server 讀寫 |
+| SQL Server 資料檔 | `.mdf` | 8KB 分頁對齊＋頁面型別結構（檔案標頭/PFS/GAM/SGAM） | 需先附加引擎 | 經 SQL Server 讀寫 |
 
 ```yaml
 database:
@@ -229,7 +234,7 @@ MDF 是 SQL Server 的資料檔，需先由 SQL Server 引擎附加（ATTACH）�
        table: dbo.Members   # 實際資料表名稱
    ```
 
-> 若只有 `.mdf` 沒有 `.ldf`，SQL Server 仍可附加但需額外重建記錄檔；建議向原始端取得完整一組檔案。
+> 若只有 `.mdf` 沒有 `.ldf`，SQL Server 附加時會自動為資料庫建立新的交易記錄檔（需容器有足夠權限）；為確保資料完整性，仍建議向原始端取得完整一組檔案。
 
 ### B. Windows 主機（LocalDB / SQL Server Express）
 
@@ -328,7 +333,7 @@ qrencode -o alice-totp.png "otpauth://totp/MdfQuery:alice?secret=..."   # 存成
 | 提示「已被使用」 | 同一組代碼只能用一次，等 App 跳出下一組再輸入 |
 | 提示「已暫時鎖定」 | 動態碼連續錯 5 次會鎖 5 分鐘後自動解鎖；急件可由管理員 `reset-totp` 重置失敗計數 |
 | 換手機 / App 刪除 / 遺失 | 管理員執行 `.venv/bin/python manage.py reset-totp alice`，取得**新密鑰**重新走一次第 2～4 步；舊密鑰立即失效 |
-| 忘記密碼 | 管理員先 `reset-totp`（順便解鎖），再刪除重建該帳號（目前版本未提供改密指令，可於 `adduser` 同名覆蓋前先確認設計） |
+| 忘記密碼 | 目前版本未提供改密／刪除帳號指令，且 `adduser` **無法覆蓋同名帳號**（會報「使用者已存在」）。請以 `sqlite3 instance/users.db` 手動刪除該帳號列後重新 `adduser`，例如：`sqlite3 instance/users.db "DELETE FROM users WHERE username='alice';"` |
 | 帳號被鎖定 | 連續錯 5 次密碼會鎖 5 分鐘後自動解鎖；急件可由管理員 `reset-totp` 重置失敗計數 |
 | 密鑰外流疑慮 | 一律視同洩漏，立即 `reset-totp` |
 
@@ -353,7 +358,7 @@ qrencode -o alice-totp.png "otpauth://totp/MdfQuery:alice?secret=..."   # 存成
 ### 本機測試
 
 ```bash
-.venv/bin/python -m unittest discover -s tests -p "test_*.py"   # 單元 + E2E + 多格式 + 帳號庫測試（51 例）
+.venv/bin/python -m unittest discover -s tests -p "test_*.py"   # 單元 + E2E + 多格式 + 帳號庫測試（52 例）
 ./scripts/smoke_test.sh                                          # 本機 HTTP 全流程煙霧測試（SQLite 示範模式）
 .venv/bin/python manage.py detect <檔案>                          # 判別任意資料庫檔案類型
 ```
@@ -375,10 +380,11 @@ GitHub Actions 工作流程（`.github/workflows/ci.yml`）每次推送自動執
 ## 上線前建議
 
 - 以反向代理（nginx/Caddy）加上 HTTPS，並於 `config.yaml` 設 `server.secure_cookie: true` 讓 Session Cookie 帶上 `Secure` 旗標
-- SQL Server 資料量大時，請為排序欄位（預設為身份證對應欄）建立索引，例如：
+- SQL Server 資料量大時，請為排序欄位（預設為身份證對應欄，如下例的 `NationalID`）建立索引：
   ```sql
-  CREATE INDEX IX_Members_IdCard ON dbo.Members (IdCard);
+  CREATE INDEX IX_Members_NationalID ON dbo.Members (NationalID);
   ```
+  欄位名請替換為你資料表實際的身份證對應欄（可在登入頁「已載入」橫幅旁的欄位標籤查看）。
   分頁器「上一頁／下一頁」使用 keyset 定位，深頁瀏覽不需重掃 OFFSET；排序欄位值重複時可能略過同值列，建議排序欄位接近唯一
 - 更換 Docker `SA_PASSWORD`，勿使用範例值
 - 定期備份 `instance/users.db`（遺失等同重建所有帳號）
