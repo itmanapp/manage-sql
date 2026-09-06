@@ -82,6 +82,89 @@ cp config.yaml.example config.yaml        # 預設 backend: sqlite
 
 登入流程：輸入帳密 → 在驗證器 App（Google Authenticator、Aegis 等）以手動輸入方式新增剛才的 Base32 密鑰 → 輸入 6 位動態碼完成登入。
 
+## AI 代理安裝指引（新設備自動部署）
+
+當安裝工作交由 **AI 代理（Claude / Codex / Copilot 等）** 在新設備上協助執行時，本節提供必要的工具清單與逐步指令。所有指令皆已在乾淨環境驗證。
+
+### 1. 必要工具清單
+
+| 工具 | 用途 | 檢查方式 |
+|---|---|---|
+| `git` | 取得專案 | `git --version` |
+| Python **3.10+**（建議 3.11／3.12） | 執行環境 | `python3 --version` |
+| `venv`（Debian/Ubuntu 需 `python3-venv`） | 隔離相依套件 | `python3 -m venv .venv`（失敗時見「環境差異」） |
+| pip 網路存取 | 安裝 5 個相依套件 | 離線環境見「環境差異」 |
+| `curl` | 健康檢查 | `curl --version` |
+| Docker + Compose（**選配**） | 僅「載入 MDF」流程需要 SQL Server 2022 容器 | `docker --version` |
+| 驗證器 App（Google Authenticator 等） | 操作者手機上的 TOTP 第二階段登入 | 非本機工具；無手機時可用 `tests/gen_totp.py` 代替（見下） |
+
+### 2. 標準安裝步驟（依序執行）
+
+```bash
+# [1] 取得專案
+git clone https://github.com/itmanapp/manage-sql.git && cd manage-sql
+
+# [2] 安裝相依套件（優先使用 venv）
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+# 無法建立 venv 時的替代方案（--target 安裝，之後用 PYTHONPATH 執行）：
+# python3 -m pip install --target _deps -r requirements.txt
+# export PYTHONPATH=$PWD/_deps:$PWD
+
+# [3] 建立設定檔（SQLite 示範模式免修改）
+cp config.yaml.example config.yaml
+
+# [4] 建立示範資料與登入帳號
+.venv/bin/python manage.py seed-demo
+```
+
+### 3. AI 代理互動重點（與人類操作不同之處）
+
+1. **`manage.py adduser` 用 `getpass` 讀密碼**：沒有終端 TTY 時改從 stdin 讀取，可直接以管道餵入（密碼至少 8 碼，需輸入兩次）：
+   ```bash
+   printf 'YourPass123!\nYourPass123!\n' | .venv/bin/python manage.py adduser admin
+   ```
+   stderr 會出現 `GetPassWarning`（提示密碼可能被回顯），可忽略；**只解析 stdout** 擷取 `密鑰（Base32）：` 那一行。
+
+2. **TOTP 密鑰只顯示一次**：`adduser` 輸出的 Base32 密鑰與 `otpauth://` URI 必須立即記錄；遺失只能 `manage.py reset-totp <user>` 重建。
+
+3. **無手機驗證器時的登入驗證**：以專案內工具計算「當下 30 秒窗」的動態碼，代替真人輸入：
+   ```bash
+   SECRET=<Base32密鑰> .venv/bin/python tests/gen_totp.py
+   ```
+
+4. **`run.py` 是前景伺服器**：背景化後務必健康檢查：
+   ```bash
+   nohup .venv/bin/python run.py > /tmp/manage-sql.log 2>&1 &
+   curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/login   # 預期 200
+   ```
+
+### 4. 安裝完成驗收標準（全部通過才算完成）
+
+- [ ] `python3 -m unittest discover -s tests -p "test_*.py"` → **51 例全數 OK**
+- [ ] `curl` 登入頁回 **200**（伺服器已啟動）
+- [ ] `./scripts/smoke_test.sh`（需 venv 環境）→ 最後輸出 `SMOKE TEST DONE`
+- [ ] 以「密碼 + 當下動態碼」登入成功後，搜尋 `王小美` 可找到示範資料（身份證 `A289635741`）
+
+### 5. 常見環境差異
+
+| 情境 | 處理方式 |
+|---|---|
+| Debian/Ubuntu 缺 `venv` | `apt install python3-venv python3-full`（需 root）；否則改用 `--target` 方案 |
+| PEP 668（externally-managed）拒絕 pip | 一律使用 venv 或 `--target`，不要直接 `pip install` 進系統 |
+| Windows | `py -3.12 -m venv .venv`；執行檔為 `.venv\Scripts\python`；MDF 可用 LocalDB／SQL Server Express（見「正式環境」） |
+| 完全離線環境 | 在有網路的機器先 `pip download -r requirements.txt -d wheels/` 一起帶入；安裝後登入、查詢全程不需網路 |
+| 沒有 Docker | 跳過 MDF 章節即可；SQLite／DBF／Access 功能完全不受影響 |
+| DBF 中文亂碼 | `config.yaml` 設 `database.encoding: big5`（或 gbk） |
+
+### 6. AI 代理容易踩的坑
+
+- `adduser` 的警告訊息（GetPassWarning）出現在 **stderr**，擷取密鑰時只讀 stdout
+- `config.yaml` 的 SQL Server 密碼若含特殊字元（`#`、`:` 等），需用引號包住（YAML 字串語法）
+- MDF 檔在 `backend: auto` 下會被正確偵測，但會要求改用 `backend: sqlserver`（需先附加引擎）— 這是設計行為，不是錯誤
+- TOTP 具**重放防護**：同一 30 秒窗的動態碼只能使用一次；自動化連續登入需等下一窗或平行使用不同帳號
+- 兩個伺服器實例若共用同一個 `instance/users.db`，TOTP 密鑰與失敗計數也會共用
+
 ## 支援格式與自動判別
 
 設定 `backend: auto` 並指定檔案路徑，系統會先以**魔術位元組＋標頭結構**判別檔案類型再載入：
