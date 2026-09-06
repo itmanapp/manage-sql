@@ -5,6 +5,7 @@ import time
 import unittest
 
 from app.users import (
+    MAX_FAILURES,
     MAX_TOTP_FAILURES,
     TOTP_LOCK_SECONDS,
     UserStore,
@@ -70,6 +71,20 @@ class UserStoreTests(unittest.TestCase):
         self.assertLessEqual(
             user["totp_locked_until"] - time.time(), TOTP_LOCK_SECONDS + 1
         )
+
+    def test_reset_totp_clears_all_lock_state(self):
+        for _ in range(MAX_TOTP_FAILURES):
+            self.store.record_totp_failure("alice")
+        for _ in range(MAX_FAILURES):
+            self.store.record_failure("alice")
+        self.assertTrue(self.store.reset_totp("alice", "NEWSECRET"))
+        user = self.store.get("alice")
+        self.assertEqual(user["totp_failures"], 0)
+        self.assertEqual(user["totp_locked_until"], 0)
+        self.assertEqual(user["failed_attempts"], 0)
+        self.assertEqual(user["locked_until"], 0)
+        self.assertEqual(user["totp_secret"], "NEWSECRET")
+        self.assertIsNone(user["totp_last_step"])
 
     def test_db_file_permissions_restricted(self):
         if os.name == "nt":

@@ -90,7 +90,9 @@ class UserStore:
         with self._conn() as conn:
             cur = conn.execute(
                 "UPDATE users SET totp_secret = ?, totp_last_step = NULL,"
-                " failed_attempts = 0, locked_until = 0 WHERE username = ?",
+                " failed_attempts = 0, locked_until = 0,"
+                " totp_failures = 0, totp_locked_until = 0"
+                " WHERE username = ?",
                 (secret, username),
             )
         return cur.rowcount > 0
